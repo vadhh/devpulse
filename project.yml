@@ -1,0 +1,29 @@
+name: DevPulse
+
+options:
+  bundleIdPrefix: com.st4rdhoom
+  deploymentTarget:
+    macOS: "11.0"
+
+packages:
+  PockKit:
+    url: https://github.com/pock/pockkit.git
+    branch: master
+
+targets:
+  DevPulse:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: DevPulse/Sources
+    dependencies:
+      - package: PockKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.st4rdhoom.devpulse
+        PRODUCT_NAME: DevPulse
+        WRAPPER_EXTENSION: pock
+        INFOPLIST_FILE: DevPulse/Info.plist
+        SWIFT_VERSION: "5.0"
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Automatic
