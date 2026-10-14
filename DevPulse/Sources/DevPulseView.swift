@@ -262,7 +262,7 @@ final class DevPulseView: NSView {
         guard let interval = wanted else { return }
 
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            self?.needsDisplay = true
+            self?.invalidateAnimatingGraphs()
             // Drops back to a slower rate (or none) once the intro ends.
             self?.updateAnimation()
         }
@@ -277,13 +277,37 @@ final class DevPulseView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let meters = self.meters
         let graph = Graph.current
-        var x = ((bounds.width - width(meters, graph: graph)) / 2).rounded() + Self.padding
-
-        for meter in meters {
+        for (meter, x) in layout(graph) where needsToDraw(slot(at: x, meter, graph: graph)) {
             drawMeter(at: x, meter, graph: graph)
-            x += Self.meterWidth(graph, showsValue: meter.showsValue) + Self.meterSpacing
+        }
+    }
+
+    /// Each visible meter with its left edge.
+    private func layout(_ graph: Graph) -> [(meter: Meter, x: CGFloat)] {
+        let meters = self.meters
+        var x = ((bounds.width - width(meters, graph: graph)) / 2).rounded() + Self.padding
+        return meters.map { meter in
+            defer { x += Self.meterWidth(graph, showsValue: meter.showsValue) + Self.meterSpacing }
+            return (meter, x)
+        }
+    }
+
+    private func slot(at x: CGFloat, _ meter: Meter, graph: Graph) -> NSRect {
+        NSRect(x: x, y: 0, width: Self.meterWidth(graph, showsValue: meter.showsValue), height: bounds.height)
+    }
+
+    /// Animation frames redraw only the graphs that move, not icons, text or
+    /// still meters: full-view redraws at 20fps kept Pock at ~35% CPU.
+    private func invalidateAnimatingGraphs() {
+        let graph = Graph.current
+        let now = ProcessInfo.processInfo.systemUptime
+        for (meter, x) in layout(graph) {
+            let intro = meter.introStart.map { now - $0 < Self.introDuration } ?? false
+            guard meter.animation != .none || meter.breathPeriod != nil || intro else { continue }
+            setNeedsDisplay(NSRect(
+                x: x + Self.iconSlot.width + Self.gap, y: 0, width: graph.width, height: bounds.height
+            ))
         }
     }
 
@@ -311,6 +335,11 @@ final class DevPulseView: NSView {
         let chargePhase = Int(now / Self.chargeStep)
         // 0 = green, 1 = blue; cosine eases the turn at each end.
         let blue = CGFloat(1 - cos(2 * .pi * now / Self.colorCycle)) / 2
+        // Resolve the dynamic colours once per frame: blending them per dot
+        // was the hottest path in the animation.
+        let unlit = meter.unlitColor.usingColorSpace(.sRGB) ?? meter.unlitColor
+        let adapterBlue = NSColor.systemBlue.usingColorSpace(.sRGB) ?? .systemBlue
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
 
         let cells = meter.chips
             ? Self.chipColumns(history.last ?? nil, columns: graph.columns, rows: graph.rows)
@@ -332,14 +361,15 @@ final class DevPulseView: NSView {
                 ? ((chargePhase - column) % (empty + 1) + empty + 1) % (empty + 1)
                 : 0
 
+            var litColor = meter.color(value ?? 0).usingColorSpace(.sRGB) ?? meter.color(value ?? 0)
+            if meter.animation == .onAdapter {
+                litColor = litColor.blended(withFraction: blue, of: adapterBlue) ?? litColor
+            }
+
             for row in 0..<graph.rows {
                 guard let on = dots[row] else { continue }
                 var color: NSColor
                 if on {
-                    var litColor = meter.color(value ?? 0)
-                    if meter.animation == .onAdapter {
-                        litColor = litColor.blended(withFraction: blue, of: .systemBlue) ?? litColor
-                    }
                     // Dots fade out in 2×2 blocks (single dots are too small
                     // to see at small dot sizes), plus single dots on top
                     // for extra sparkle.
@@ -348,7 +378,7 @@ final class DevPulseView: NSView {
                               Self.fade(column: column, row: row, time: now))
                         : 0
                     color = off > 0
-                        ? litColor.blended(withFraction: off, of: meter.unlitColor) ?? litColor
+                        ? litColor.blended(withFraction: off, of: unlit) ?? litColor
                         : litColor
                     if let period = meter.breathPeriod {
                         // Dims to half brightness and back on a cosine curve.
@@ -358,7 +388,7 @@ final class DevPulseView: NSView {
                 } else if row < lit + rising {
                     color = meter.color(value ?? 0).withAlphaComponent(0.6)
                 } else {
-                    color = meter.unlitColor
+                    color = unlit
                 }
                 if !on, let start = meter.introStart, now - start < Self.introDuration {
                     // Intro: the grid starts full and the dots above the
@@ -366,13 +396,13 @@ final class DevPulseView: NSView {
                     let off = Self.sparkle(column: column, row: row, elapsed: now - start)
                     color = meter.color(value ?? 0).blended(withFraction: off, of: color) ?? color
                 }
-                color.setFill()
-                NSBezierPath(ovalIn: NSRect(
+                context.setFillColor(color.cgColor)
+                context.fillEllipse(in: CGRect(
                     x: left + CGFloat(column) * graph.pitch,
                     y: bottom + CGFloat(row) * graph.pitch,
                     width: graph.dot,
                     height: graph.dot
-                )).fill()
+                ))
             }
         }
         guard meter.showsValue else { return }
@@ -457,18 +487,33 @@ final class DevPulseView: NSView {
         return CGFloat(s * s)
     }
 
-    /// SF Symbol painted grey (symbol images ignore the fill colour).
+    /// SF Symbol painted grey (symbol images ignore the fill colour),
+    /// rendered once into a Retina bitmap so frames don't redraw the vector.
+    private static var icons: [String: NSImage] = [:]
     private static func icon(_ name: String) -> NSImage? {
+        if let icon = icons[name] { return icon }
         guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
         else { return nil }
 
-        return NSImage(size: symbol.size, flipped: false) { rect in
-            symbol.draw(in: rect)
-            NSColor.secondaryLabelColor.set()
-            rect.fill(using: .sourceAtop)
-            return true
-        }
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: Int((symbol.size.width * 2).rounded(.up)),
+            pixelsHigh: Int((symbol.size.height * 2).rounded(.up)), bitsPerSample: 8, samplesPerPixel: 4,
+            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { return nil }
+        bitmap.size = symbol.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+        let rect = NSRect(origin: .zero, size: symbol.size)
+        symbol.draw(in: rect)
+        NSColor.secondaryLabelColor.set()
+        rect.fill(using: .sourceAtop)
+        NSGraphicsContext.restoreGraphicsState()
+
+        let icon = NSImage(size: symbol.size)
+        icon.addRepresentation(bitmap)
+        icons[name] = icon
+        return icon
     }
 
     private static func loadColor(_ value: Int) -> NSColor {

@@ -20,6 +20,7 @@ This runs `swift build -c release` using `Package.swift`, and needs only the Com
 - `project.yml` is the old XcodeGen/Xcode setup and isn't used anymore.
 - The `com.st4rdhoom.devpulse` defaults domain holds the user's live widget settings, and the running Pock reads it. Don't write or `defaults delete` it while testing.
 - Don't create fonts or measure text inside `draw(_:)` or the width functions. `DevPulseView.text` caches the font and value width per text size. Creating them on every call at animation frame rates crashed Pock inside CoreText (`NSInvalidArgumentException: attempt to insert nil object` from `sizeWithAttributes:`). Crash reports are in `~/Library/Logs/DiagnosticReports/Pock-*.ips`.
+- Keep animation frames cheap; they run at 20fps inside Pock. The timer calls `invalidateAnimatingGraphs()`, which invalidates only the graph rects of meters that move, and `draw` skips meters outside the dirty rect. Icons are rendered once into cached Retina bitmaps (`icons`). Dynamic colours are resolved to sRGB once per meter or column, never blended per dot. Full-view redraws at 20fps kept Pock at ~35% CPU; measure with `top -pid $(pgrep -x Pock)` and `sample Pock 5`.
 - There are no tests or linters. To verify a change, install it and look at the Touch Bar. Tapping the widget forces a refresh.
 
 ## Architecture
